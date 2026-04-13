@@ -1,10 +1,10 @@
-from .pygame_visualization import LaneRenderer
-from .reward_function_17032026 import RewardFunction
-from .compute_safe_acc_30032026 import ComputeSafeACC
+import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from .utils.pygame_visualization import LaneRenderer
+from .utils.reward_function_17032026 import RewardFunction
+from .utils.compute_safe_acc_30032026 import ComputeSafeACC
 
 NUM_AGENTS = 6
 
@@ -23,13 +23,12 @@ def env_creator(config):
 class MultiAgentLaneChangeEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, num_lanes=3, num_agents=3, gamma=0.99, lambda_x=1, lambda_y=2, lambda_collision=5, lambda_control=0.05, d_safe=1, target_lane_reward=20):
+    def __init__(self, num_lanes=3, num_agents=3, gamma=0.99, lambda_x=1, lambda_y=2, lambda_collision=5, lambda_control=0.05, d_safe=0.2, target_lane_reward=20, attention=False):
         super().__init__()
 
         # --------------------------
         # Environment Parameters
         # --------------------------
-        self.agents = {}
         self.num_lanes = num_lanes
         self.num_agents = num_agents
         self.dt = 0.1
@@ -87,6 +86,9 @@ class MultiAgentLaneChangeEnv(gym.Env):
         # terminal reward
         self.target_lane_reward = target_lane_reward
 
+        #attention
+        self.attention = attention
+
         # --------------------------
         # Gym Spaces
         # --------------------------
@@ -98,21 +100,20 @@ class MultiAgentLaneChangeEnv(gym.Env):
             dtype=np.float32
         )
 
-        self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(self.num_agents * 8,),
-            dtype=np.float32
-        )
+        self.observation_space = spaces.Dict({
+            "ego": spaces.Box(low=-1.0, high=1.0, shape=(self.num_agents, 6), dtype=np.float32),
+            "neighbors": spaces.Box(low=-1.0, high=1.0, shape=(self.num_agents, 5, 7), dtype=np.float32)
+        })
 
         # Rendering
-        self.renderer = LaneRenderer(
-        self.x_end,
-        self.y_min,
-        self.y_max,
-        self.lane_centers,
-        self.lane_width
-    )
+        # self.renderer = LaneRenderer(
+        #     self.x_end,
+        #     self.y_min,
+        #     self.y_max,
+        #     self.lane_centers,
+        #     self.lane_width,
+        #     self.attention
+        # )
 
         self.reset()
 
@@ -128,13 +129,14 @@ class MultiAgentLaneChangeEnv(gym.Env):
 
         for i in range(self.num_agents):
             self.agents[i] = {
-                "x": self.x_start,
+                "x": (self.x_end - self.x_start) * self.np_random.random() + self.x_start,
                 "y": self.lane_centers[self.np_random.integers(0, 3)],
                 "target_lane": self.np_random.integers(0, 3),
                 "v": 0.5,
                 "theta": 0.0,
                 "omega": 0.0,
             }
+            # print(self.agents[i])
 
         return self._get_joint_obs(), {}
 
@@ -142,33 +144,96 @@ class MultiAgentLaneChangeEnv(gym.Env):
     # Observation
     # ------------------------------------------------
 
+    def _get_ego_state(self, i):
+        ego = self.agents[i]
+
+        current_lane = np.argmin(np.abs(self.lane_centers - ego["y"]))
+        delta_lane = ego["target_lane"] - current_lane
+        d_deadline = (self.x_end - ego["x"]) / self.x_end
+
+        ego_feat = np.array([
+            ego["v"] / self.v_max,
+            ego["theta"] / self.theta_max,
+            ego["omega"] / self.omega_max,
+            current_lane / (self.num_lanes - 1),
+            delta_lane / self.num_lanes,
+            d_deadline
+        ], dtype=np.float32)
+
+        return ego_feat
+    
+    def _get_nearby_agents(self, i, max_neighbors=5, dx_thresh=0.3, dy_thresh=0.3):
+        ego = self.agents[i]
+        neighbors = []
+
+        for j in range(self.num_agents):
+            if i == j:
+                continue
+
+            other = self.agents[j]
+
+            dx = (other["x"] - ego["x"]) / self.x_end
+            dy = (other["y"] - ego["y"]) / (self.y_max - self.y_min)
+
+            if abs(dx) < dx_thresh and abs(dy) < dy_thresh:
+                neighbors.append((j, dx, dy))
+
+        # sort by distance (important for stability)
+        neighbors.sort(key=lambda x: abs(x[1]))
+
+        return neighbors[:max_neighbors]
+    
+    def _get_neighbor_state(self, i, neighbor_list, max_neighbors=5):
+        ego = self.agents[i]
+
+        neighbor_feats = []
+
+        for (j, dx, dy) in neighbor_list:
+            other = self.agents[j]
+
+            dv = (other["v"] - ego["v"]) / self.v_max
+
+            current_lane_j = np.argmin(np.abs(self.lane_centers - other["y"]))
+            target_flag = 1.0 if current_lane_j == ego["target_lane"] else 0.0
+
+            feat = np.array([
+                dx,
+                dy,
+                dv,
+                other["theta"] / self.theta_max,
+                other["omega"] / self.omega_max,
+                current_lane_j / (self.num_lanes - 1),
+                target_flag
+            ], dtype=np.float32)
+
+            neighbor_feats.append(feat)
+
+        # padding (critical for transformer)
+        while len(neighbor_feats) < max_neighbors:
+            neighbor_feats.append(np.zeros(7, dtype=np.float32))
+
+        return np.array(neighbor_feats)
+
     def _get_joint_obs(self):
 
-        obs = []
+        ego_list = []
+        neighbors_list = []
 
         for i in range(self.num_agents):
-            a = self.agents[i]
-            x_norm = a["x"] / self.x_end
-            y_norm = (a["y"] - self.y_min) / (self.y_max - self.y_min)
-            v_norm = a["v"] / self.v_max
-            omega_norm = a["omega"] / self.omega_max
-            theta_sin = np.sin(a["theta"])
-            theta_cos = np.cos(a["theta"])
-            target_lane_norm = a["target_lane"] / (len(self.lane_centers) - 1)
-            dist_goal_norm = (self.x_end - a["x"]) / self.x_end
 
-            obs.append([
-                x_norm,
-                y_norm,
-                v_norm,
-                theta_sin,
-                theta_cos,
-                omega_norm,
-                target_lane_norm,
-                dist_goal_norm
-            ])
+            ego_feat = self._get_ego_state(i)
 
-        return np.array(obs, dtype=np.float32).flatten()
+            neighbors_idx = self._get_nearby_agents(i)
+
+            neighbor_feats = self._get_neighbor_state(i, neighbors_idx)
+
+            ego_list.append(ego_feat)
+            neighbors_list.append(neighbor_feats)
+
+        return {
+            "ego": np.array(ego_list, dtype=np.float32),
+            "neighbors": np.array(neighbors_list, dtype=np.float32)
+        }
 
     # ------------------------------------------------
     # SAFE SET FOR COLLISION AVOIDANCE
@@ -185,9 +250,22 @@ class MultiAgentLaneChangeEnv(gym.Env):
     # ------------------------------------------------
     # Reward Functions
     # ------------------------------------------------
-    
+
     def _compute_reward(self, i, prev_agent, a_lin, a_ang):
         return RewardFunction(self.__dict__)._compute_reward(i, prev_agent, a_lin, a_ang)
+    
+    # ------------------------------------------------
+    # Check Collision
+    # ------------------------------------------------
+
+    def _check_collision(self):
+        positions = np.array([[a["x"], a["y"]] for a in self.agents.values()])
+
+        for i in range(len(positions)):
+            dists = np.linalg.norm(positions[i+1:] - positions[i], axis=1)
+            if np.any(dists < self.d_safe):
+                return True
+        return False
 
     # ------------------------------------------------
     # STEP
@@ -257,12 +335,15 @@ class MultiAgentLaneChangeEnv(gym.Env):
             
             total_reward += self._compute_reward(i, prev_agents[i], a_lin, a_ang)
 
-        terminated = all(
-            self.agents[i]["x"] >= self.x_end
-            for i in range(self.num_agents)
+        collision = self._check_collision()
+
+        if collision:
+            total_reward -= self.lambda_collision * 10  # large penalty for collision
+
+        terminated = (
+            collision or 
+            all(self.agents[i]["x"] >= self.x_end for i in range(self.num_agents))
         )
-        # if self.step_count >= 1:
-            # terminated = True
 
         truncated = self.step_count >= self.max_steps
 
@@ -275,3 +356,72 @@ class MultiAgentLaneChangeEnv(gym.Env):
     def render(self):
         self.renderer.render(self.agents)
 
+    # ------------------------------------------------
+    # GRID OBSERVATION (for CNN policy)
+    # ------------------------------------------------
+
+    def _get_grid_obs(self):
+        H, W = 10, 30   # (lanes × longitudinal discretization)
+        C = 4           # channels
+
+        grid = np.zeros((H, W, C), dtype=np.float32)
+
+        for i in range(self.num_agents):
+            a = self.agents[i]
+
+            # discretize
+            row = int((a["y"] - self.y_min) / (self.y_max - self.y_min) * (H - 1))
+            col = int(a["x"] / self.x_end * (W - 1))
+
+            # channels
+            grid[row, col, 0] = 1.0                  # occupancy
+            grid[row, col, 1] = a["v"] / self.v_max  # velocity
+            grid[row, col, 2] = a["omega"] / self.omega_max
+            grid[row, col, 3] = i / self.num_agents  # agent id encoding
+
+        return grid
+
+# # --- Execution ---
+# ray.init()
+
+# register_env("lane_change_env", env_creator)
+
+# config = (
+#     PPOConfig()
+#     .environment(
+#         env="lane_change_env",
+#         env_config={"num_agents": NUM_AGENTS}
+#     )
+#     .framework("torch")
+#     .rollouts(num_rollout_workers=0)
+#     .callbacks(RenderCallback)
+# )
+
+# algo = config.build()
+
+# for i in range(200):
+
+#     result = algo.train()
+
+#     print(
+#         f"Iteration {i}",
+#         result["episode_reward_mean"]
+#     )
+
+# print("Starting Test Run...")
+# for __ in range(10):
+#     env = MultiAgentLaneChangeEnv(num_agents=NUM_AGENTS)
+#     obs, _ = env.reset()
+#     play = int(input())
+#     if (play):
+#         for _ in tqdm(range(500)):
+
+#             action = algo.get_policy().compute_single_action(obs)
+
+#             obs, reward, terminated, truncated, _ = env.step(action[0])
+
+#             env.render()
+
+#             if terminated or truncated:
+#                 break
+#     else: continue

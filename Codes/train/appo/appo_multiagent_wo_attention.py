@@ -1,5 +1,5 @@
 import ray
-from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.appo import APPOConfig
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models import ModelCatalog
 from ray.tune.registry import register_env
@@ -115,7 +115,7 @@ ray.init()
 # =========================================================
 
 config = (
-    PPOConfig()
+    APPOConfig()
     .environment(
         env="lane_change_env",
         env_config={"num_agents": 6}
@@ -126,7 +126,9 @@ config = (
         model={
             "custom_model": "no_attn_model",
         },
-        train_batch_size=4000,
+        train_batch_size=8000,       
+        sgd_minibatch_size=128,    
+        num_sgd_iter=10, 
         gamma=0.99,
         lr=3e-4,
         entropy_coeff=0.01,
@@ -142,7 +144,7 @@ algo = config.build()
 
 reward_history = []
 
-for i in range(200):
+for i in range(2000):
 
     result = algo.train()
     reward_mean = result["episode_reward_mean"]
@@ -167,5 +169,5 @@ plt.xlabel('Training Iteration')
 plt.ylabel('Episode Reward Mean')
 plt.grid(True)
 plt.tight_layout()
-plt.savefig('reward_curve_no_attn.png')
+plt.savefig('reward_curve_no_attn_appo.png')
 plt.show()
