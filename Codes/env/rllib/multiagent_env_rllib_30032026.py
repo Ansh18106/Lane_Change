@@ -2,9 +2,9 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from .utils.pygame_visualization import LaneRenderer
-from .utils.reward_function_17032026 import RewardFunction
-from .utils.compute_safe_acc_30032026 import ComputeSafeACC
+from env.utils.pygame_visualization import LaneRenderer
+from env.utils.reward_function_17032026 import RewardFunction
+from env.utils.compute_safe_acc_30032026 import ComputeSafeACC
 
 NUM_AGENTS = 6
 
@@ -271,83 +271,94 @@ class MultiAgentLaneChangeEnv(gym.Env):
     # STEP
     # ------------------------------------------------
 
-    def step(self, action):
-
+    def step(self, action_dict):
         prev_agents = {i: self.agents[i].copy() for i in range(self.num_agents)}
+        rewards = {}
+        infos = {f"agent_{i}": {} for i in range(self.num_agents)}
+        terminateds = {}
+        truncateds = {}
 
         self.step_count += 1
-        total_reward = 0.0
 
+        # ------------------------------------------------
+        # 1. Apply actions + dynamics
+        # ------------------------------------------------
         for i in range(self.num_agents):
+
+            agent_id = f"agent_{i}"
+            action = action_dict.get(agent_id, np.zeros(2))
+
+            a_min_i, a_max_i = self._compute_safe_accel_bounds(i)
+
+            a_lin = np.clip(action[0], a_min_i, a_max_i)
+            a_ang = np.clip(action[1], self.alpha_min, self.alpha_max)
 
             agent = self.agents[i]
 
-            # ----------------------------
-            # Safe-set projection
-            # ----------------------------
-            a_min_i, a_max_i = self._compute_safe_accel_bounds(i)
+            # dynamics
+            agent["v"] = np.clip(agent["v"] + a_lin * self.dt, self.v_min, self.v_max)
+            agent["omega"] = np.clip(agent["omega"] + a_ang * self.dt, self.omega_min, self.omega_max)
 
-            a_lin = np.clip(action[2*i], a_min_i, a_max_i)
-            a_ang = np.clip(action[2*i+1],
-                            self.alpha_min, self.alpha_max)
-
-            # ----------------------------
-            # Velocity update
-            # v_{t+1} = v_t + a dt
-            # ----------------------------
-            agent["v"] = np.clip(
-                agent["v"] + a_lin * self.dt,
-                self.v_min,
-                self.v_max
-            )
-
-            agent["omega"] = np.clip(
-                agent["omega"] + a_ang * self.dt,
-                self.omega_min,
-                self.omega_max
-            )
-
-            # ----------------------------
-            # State update
-            # x_{t+1}, y_{t+1}, theta_{t+1}
-            # ----------------------------
             agent["theta"] += agent["omega"] * self.dt
-            agent["theta"] = np.clip(
-                agent["theta"],
-                self.theta_min,
-                self.theta_max
-            )
-            
+            agent["theta"] = np.clip(agent["theta"], self.theta_min, self.theta_max)
+
             agent["x"] += agent["v"] * np.cos(agent["theta"]) * self.dt
-            agent["x"] = np.clip(agent["x"], self.x_start, self.x_end)
-
-
             agent["y"] += agent["v"] * np.sin(agent["theta"]) * self.dt
 
-            # State constraint on y
-            agent["y"] = np.clip(agent["y"],
-                                 self.y_min,
-                                 self.y_max)
+            agent["y"] = np.clip(agent["y"], self.y_min, self.y_max)
 
-            # ----------------------------
-            # Reward
-            # ----------------------------
-            
-            total_reward += self._compute_reward(i, prev_agents[i], a_lin, a_ang)
+            # reward (base)
+            r = self._compute_reward(i, prev_agents[i], a_lin, a_ang)
+            rewards[agent_id] = r
 
+        # ------------------------------------------------
+        # 2. Collision handling (FIXED)
+        # ------------------------------------------------
         collision = self._check_collision()
+        collision_flag = int(collision)
 
         if collision:
-            total_reward -= self.lambda_collision * 10  # large penalty for collision
+            for i in range(self.num_agents):
+                agent_id = f"agent_{i}"
+                rewards[agent_id] -= self.lambda_collision * 20   #  stronger penalty
 
-        terminated = (
-            collision or 
-            all(self.agents[i]["x"] >= self.x_end for i in range(self.num_agents))
-        )
+        # ------------------------------------------------
+        # 3. Termination logic (FIXED)
+        # ------------------------------------------------
+        reached_goal = all(self.agents[i]["x"] >= self.x_end for i in range(self.num_agents))
 
-        truncated = self.step_count >= self.max_steps
+        # DO NOT terminate on collision immediately
+        terminated = bool(reached_goal)
 
-        return self._get_joint_obs(), total_reward, terminated, truncated, {}
+        truncated = bool(self.step_count >= self.max_steps)
+
+        # ------------------------------------------------
+        # 4. Fill RLlib dicts
+        # ------------------------------------------------
+        for i in range(self.num_agents):
+            agent_id = f"agent_{i}"
+
+            infos[agent_id] = {
+                "collision": collision_flag
+            }
+
+            terminateds[agent_id] = terminated
+            truncateds[agent_id] = truncated
+
+        terminateds["__all__"] = terminated
+        truncateds["__all__"] = truncated
+
+        # global info (important for logging)
+        infos["__all__"] = {
+            "collision": collision_flag
+        }
+
+        # ------------------------------------------------
+        # 5. Observation
+        # ------------------------------------------------
+        obs = self._get_joint_obs()
+
+        return obs, rewards, terminateds, truncateds, infos
 
     # ------------------------------------------------
     # RENDER

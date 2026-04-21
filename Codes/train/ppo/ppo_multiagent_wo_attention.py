@@ -9,8 +9,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
-from env.multiagent_env_rllib_30032026 import RenderCallback, env_creator
-
+from env.rllib.multiagent_env_rllib_30032026 import RenderCallback, env_creator
 
 class NoAttentionPolicyModel(TorchModelV2, nn.Module):
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
@@ -53,8 +52,8 @@ class NoAttentionPolicyModel(TorchModelV2, nn.Module):
 
         obs = input_dict["obs"]
 
-        ego = torch.tensor(obs["ego"], dtype=torch.float32)
-        neighbors = torch.tensor(obs["neighbors"], dtype=torch.float32)
+        ego = obs["ego"].float()
+        neighbors = obs["neighbors"].float()
 
         # Shape handling (same as your attention model)
         if ego.dim() == 2:
@@ -141,37 +140,65 @@ algo = config.build()
 # Training Loop
 # =========================================================
 
+
 reward_history = []
-total_start_time = time.time()
-for i in range(500):
-    iter_start_time = time.time()
+collision_history = []
+start_time = time()
+
+for i in range(100):
+
+    iter_start_time = time()
     result = algo.train()
+    iter_end_time = time()
     reward_mean = result["episode_reward_mean"]
+    collision_rate = result.get("custom_metrics", {}).get("collision_rate_mean", 0.0)
+    collision_episode = result.get("custom_metrics", {}).get("collision_episode_mean", 0.0)
     reward_history.append(reward_mean)
-
-    iter_end_time = time.time()
+    collision_history.append(collision_rate)
     iter_duration = iter_end_time - iter_start_time
-    total_elapsed = iter_end_time - total_start_time
+    total_elapsed = iter_end_time - start_time
+    print(
+        f"PPO (NA) {i} | "
+        f"Reward: {reward_mean:.2f} | "
+        f"CollisionRate: {collision_rate:.4f} | "
+        f"CollisionEpisode: {collision_episode:.4f} | "
+        f"IterTime: {iter_duration:.2f}s | "
+        f"Total: {total_elapsed/60:.2f}m"
+    )
 
-    # Added time metrics to the print statement
-    print(f"No Attention {i} | reward = {reward_mean:.2f} | iter_time = {iter_duration:.2f}s | total_time = {total_elapsed / 60:.2f}m")
-
-    if i % 20 == 0:
+    if i % 50 == 0:
         checkpoint = algo.save()
-        # print("Checkpoint saved at", checkpoint)
-
-# pprint("Evaluation Results:", config.evaluate())
 
 # =========================================================
-# Plot the reward curve
+# PLOT
 # =========================================================
 
-plt.figure(figsize=(10, 5))
-plt.plot(reward_history, marker='o', linestyle='-')
-plt.title('PPO Training: Episode Reward Mean per Iteration')
-plt.xlabel('Training Iteration')
-plt.ylabel('Episode Reward Mean')
-plt.grid(True)
+plt.figure(figsize=(10, 12))
+
+# -------- Reward --------
+plt.subplot(3, 1, 1)
+plt.plot(reward_history)
+plt.title("Reward")
+plt.xlabel("Iteration")
+plt.ylabel("Reward")
+plt.grid()
+
+# -------- Collision Rate --------
+plt.subplot(3, 1, 2)
+plt.plot(collision_history)
+plt.title("Collision Rate (per step)")
+plt.xlabel("Iteration")
+plt.ylabel("Rate")
+plt.grid()
+
+# -------- Collision Episode --------
+plt.subplot(3, 1, 3)
+# plt.plot(collision_episode_history)
+plt.title("Collision Episode Rate")
+plt.xlabel("Iteration")
+plt.ylabel("Rate")
+plt.grid()
+
 plt.tight_layout()
-plt.savefig('reward_curve_no_attn.png')
+plt.savefig("PPO_all_metrics_wo_attention.png")
 plt.show()

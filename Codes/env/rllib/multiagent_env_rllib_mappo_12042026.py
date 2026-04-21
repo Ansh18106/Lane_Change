@@ -2,12 +2,11 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from .utils.pygame_visualization import LaneRenderer
-from .utils.reward_function_17032026 import RewardFunction
-from .utils.compute_safe_acc_30032026 import ComputeSafeACC
+from env.utils.pygame_visualization import LaneRenderer
+from env.utils.reward_function_17032026 import RewardFunction
+from env.utils.compute_safe_acc_30032026 import ComputeSafeACC
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
-NUM_AGENTS = 6
 
 class RenderCallback(DefaultCallbacks):
     def on_episode_step(self, *, worker, base_env, episode, **kwargs):
@@ -21,7 +20,7 @@ def env_creator(config):
 class MultiAgentLaneChangeEnv(MultiAgentEnv):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, num_lanes=3, num_agents=3, gamma=0.99, lambda_x=1, lambda_y=2, lambda_collision=5, lambda_control=0.05, d_safe=0.2, target_lane_reward=20):
+    def __init__(self, num_lanes=3, num_agents=3, gamma=0.99, lambda_x=1, lambda_y=2, lambda_collision=5, lambda_control=0.05, d_safe=0.2, target_lane_reward=20, collision_penalty=30.0):
         super().__init__()
 
         # --------------------------
@@ -85,6 +84,9 @@ class MultiAgentLaneChangeEnv(MultiAgentEnv):
         # terminal reward
         self.target_lane_reward = target_lane_reward
 
+        # collision penalty (for reward shaping)
+        self.collision_penalty = collision_penalty
+
         # --------------------------
         # Gym Spaces
         # --------------------------
@@ -116,13 +118,13 @@ class MultiAgentLaneChangeEnv(MultiAgentEnv):
         })
 
         # Rendering
-        # self.renderer = LaneRenderer(
-        #     self.x_end,
-        #     self.y_min,
-        #     self.y_max,
-        #     self.lane_centers,
-        #     self.lane_width
-        # )
+        self.renderer = LaneRenderer(
+            self.x_end,
+            self.y_min,
+            self.y_max,
+            self.lane_centers,
+            self.lane_width
+        )
 
         self.reset()
 
@@ -316,30 +318,46 @@ class MultiAgentLaneChangeEnv(MultiAgentEnv):
             rewards[f"agent_{i}"] = r
             total_reward += r
 
+        # 1. Initialize dictionaries to prevent KeyErrors
+        terminateds = {}
+        truncateds = {}
+        infos = {f"agent_{i}": {} for i in range(self.num_agents)}
+
+        # 2. Check for collisions
         collision = self._check_collision()
 
-        for i in range(self.num_agents):
-            infos[f"agent_{i}"]["collision"] = int(collision)
-
-        if collision:
-            for i in range(self.num_agents):
-                rewards[f"agent_{i}"] -= self.lambda_collision * 10
-
-        terminated = (
+        # 3. Determine simulation states
+        # Terminates if there is a crash OR if all agents meet their spatial deadlines
+        terminated = bool(
             collision or 
             all(self.agents[i]["x"] >= self.x_end for i in range(self.num_agents))
         )
+        truncated = bool(self.step_count >= self.max_steps)
 
-        truncated = self.step_count >= self.max_steps
-
-        obs = self._get_joint_obs()
-
+        # 4. Populate agent-specific data in a single, clean loop
         for i in range(self.num_agents):
-            terminateds[f"agent_{i}"] = terminated
-            truncateds[f"agent_{i}"] = truncated
+            agent_id = f"agent_{i}"
+            
+            # Log the collision flag for the individual agent
+            infos[agent_id]["collision"] = int(collision)
+            
+            # Apply the penalty if a crash occurred
+            if collision:
+                rewards[agent_id] -= self.lambda_collision * self.collision_penalty
+                
+            terminateds[agent_id] = terminated
+            truncateds[agent_id] = truncated
 
+        # 5. Populate global Ray RLlib data
         terminateds["__all__"] = terminated
         truncateds["__all__"] = truncated
+        
+        # NEW: Adding an "__all__" info flag. 
+        # This mirrors the termination logic and makes tracking global metrics much safer.
+        infos["__common__"] = {"collision": int(collision)}
+
+        # 6. Fetch the joint observation (which now includes your global_state for MAPPO)
+        obs = self._get_joint_obs()
 
         return obs, rewards, terminateds, truncateds, infos
 

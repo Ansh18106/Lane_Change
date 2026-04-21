@@ -7,18 +7,24 @@ class CollisionCallback(DefaultCallbacks):
         episode.user_data["steps"] = 0
 
     def on_episode_step(self, *, episode, **kwargs):
-
-        infos = getattr(episode, "_last_infos", {})  # RLlib-safe
-
-        if infos:
-            for agent_id, info in infos.items():
-                if "collision" in info:
-                    episode.user_data["collisions"] += info["collision"]
-                    break  # count once per step
-
         episode.user_data["steps"] += 1
 
+        # Use the official public API to check Agent 0's info dict safely
+        agent_info = episode.last_info_for("__common__")
+        
+        if agent_info and agent_info.get("collision", 0) > 0:
+            # We don't need a for-loop because if one crashes, they all crash.
+            episode.user_data["collisions"] += 1 
+
     def on_episode_end(self, *, episode, **kwargs):
+        # THE FIX: Check the final info dict one last time. 
+        # If the environment terminated on a crash, on_episode_step likely missed it.
+        agent_info = episode.last_info_for("__common__")
+        
+        if agent_info and agent_info.get("collision", 0) > 0:
+            # Ensure it counts as at least 1 crash
+            if episode.user_data["collisions"] == 0:
+                episode.user_data["collisions"] = 1
 
         collisions = episode.user_data["collisions"]
         steps = episode.user_data["steps"]
